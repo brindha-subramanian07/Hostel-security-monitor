@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Hostel CCTV Abnormal Activity Monitor
 
 A Flask + OpenCV web application that streams hostel CCTV camera feeds,
@@ -169,3 +170,6 @@ hostel-cctv-monitor/
     ├── script.js
     └── snapshots/         # Saved anomaly snapshots (created at runtime)
 ```
+=======
+# Hostel-security-monitor
+>>>>>>> f8c05cdb4bdb7f82cc1a0ecba0f4761f2b0ed30a
