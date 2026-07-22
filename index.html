@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Hostel CCTV Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>🏠 Hostel CCTV Monitor</h1>
+    <a class="logout" href="{{ url_for('logout') }}">Logout</a>
+  </header>
+
+  <main>
+    <section class="camera-grid">
+      {% for cam in cameras %}
+      <div class="camera-card">
+        <div class="camera-title">
+          <span>{{ cam.name }}</span>
+          <span class="status-dot" id="status-{{ cam.id }}"></span>
+        </div>
+        <img src="{{ url_for('video_feed', camera_id=cam.id) }}" alt="{{ cam.name }}">
+      </div>
+      {% endfor %}
+    </section>
+
+    <aside class="alert-panel">
+      <h2>⚠ Recent Alerts</h2>
+      <ul id="alert-list"></ul>
+    </aside>
+  </main>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
