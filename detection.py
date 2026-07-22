@@ -1,92 +1,183 @@
 """
-Motion / anomaly detection logic.
+Behavior detection logic.
 
-This starter implementation uses background subtraction (MOG2) to flag
-unusual movement - a practical, dependency-light way to catch things like:
-  - someone entering a restricted area after hours
-  - a sudden crowd / scuffle (large connected motion blob)
-  - loitering / unexpected activity in a corridor at night
+Uses a YOLOv8 person detector (instead of plain motion detection) so the
+system can distinguish "a person is here" from "a curtain moved" - and then
+applies rule-based logic on top of the detected people to classify WHAT kind
+of anomaly is happening:
 
-For production use, you can swap `AnomalyDetector.analyze()` to also run a
-person-detector (e.g. YOLOv8) so alerts are triggered specifically on
-"person detected" rather than any motion (pets, curtains, lighting changes).
-That swap point is marked below.
+  - "Unauthorized entry after curfew hours" - a person seen on a
+    curfew-monitored camera outside ACTIVE_HOURS
+  - "Intruder detected"                     - a person seen on a camera
+    marked intrusion_zone=True (e.g. locked storeroom, terrace)
+  - "Restricted area intrusion"              - a person's position falls
+    inside a defined restricted_zones polygon
+  - "Loitering detected"                     - a person has remained in
+    frame longer than loitering_seconds
+  - "Crowd detected"                         - person count on a camera
+    exceeds crowd_threshold
+
+Each anomaly type has its own alert cooldown per camera so one continuous
+event doesn't spam repeated alerts.
+
+The YOLO model weights (yolov8n.pt, ~6MB) download automatically the first
+time this runs and are then cached locally - the first startup needs
+internet access, later runs work offline.
 """
 
 import time
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
 import config
 
+_MODEL = None
+
+
+def get_model():
+    """Load the YOLO model once and share it across all camera threads."""
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = YOLO("yolov8n.pt")
+    return _MODEL
+
+
+def point_in_polygon(point, polygon):
+    poly = np.array(polygon, dtype=np.int32)
+    return cv2.pointPolygonTest(poly, point, False) >= 0
+
+
+class TrackedPerson:
+    """Minimal centroid tracker entry - just enough to measure dwell time
+    for loitering detection. Not a full multi-object tracker, but good
+    enough for a single-camera, low-frame-rate setup."""
+    def __init__(self, pid, centroid):
+        self.id = pid
+        self.centroid = centroid
+        self.first_seen = time.time()
+        self.last_seen = time.time()
+        self.alerted_loitering = False
+
 
 class AnomalyDetector:
-    def __init__(self, camera_id):
+    def __init__(self, camera_id, camera_cfg=None):
         self.camera_id = camera_id
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=300, varThreshold=40, detectShadows=True
-        )
-        self.consecutive_motion_frames = 0
-        self.last_alert_time = 0
+        self.cfg = camera_cfg or {}
+        self.tracked = {}
+        self.next_id = 0
+        self.last_alert_time = {}   # anomaly_type -> timestamp, for per-type cooldown
 
-    def _within_active_hours(self):
+    def _within_curfew_hours(self):
         window = config.ACTIVE_HOURS
         if not window:
-            return True
+            return False
         hour = time.localtime().tm_hour
         start, end = window["start"], window["end"]
         if start <= end:
             return start <= hour < end
-        # window wraps past midnight, e.g. 23 -> 6
-        return hour >= start or hour < end
+        return hour >= start or hour < end   # wraps past midnight, e.g. 23 -> 6
+
+    def _cooldown_ok(self, anomaly_type):
+        now = time.time()
+        last = self.last_alert_time.get(anomaly_type, 0)
+        if now - last >= config.ALERT_COOLDOWN_SECONDS:
+            self.last_alert_time[anomaly_type] = now
+            return True
+        return False
+
+    def _update_tracks(self, centroids):
+        """Very simple nearest-centroid matching frame-to-frame."""
+        used = set()
+        for c in centroids:
+            best_id, best_dist = None, 90  # max pixel distance to count as "same person"
+            for pid, tp in self.tracked.items():
+                if pid in used:
+                    continue
+                d = np.hypot(tp.centroid[0] - c[0], tp.centroid[1] - c[1])
+                if d < best_dist:
+                    best_dist, best_id = d, pid
+            if best_id is not None:
+                self.tracked[best_id].centroid = c
+                self.tracked[best_id].last_seen = time.time()
+                used.add(best_id)
+            else:
+                pid = self.next_id
+                self.next_id += 1
+                self.tracked[pid] = TrackedPerson(pid, c)
+                used.add(pid)
+
+        # drop people not seen recently (left the frame)
+        stale = [pid for pid, tp in self.tracked.items() if time.time() - tp.last_seen > 3]
+        for pid in stale:
+            del self.tracked[pid]
 
     def analyze(self, frame):
         """
-        Runs detection on a single frame.
-        Returns (is_anomaly: bool, annotated_frame, boxes: list[(x,y,w,h)])
+        Runs detection + rule logic on a single frame.
+        Returns (anomalies: list[str], annotated_frame, boxes: list[(x1,y1,x2,y2)])
+        `anomalies` may contain zero, one, or multiple labels for this frame.
         """
+        model = get_model()
+        results = model.predict(frame, classes=[0], conf=config.PERSON_CONFIDENCE,
+                                 verbose=False)[0]   # class 0 = "person" in COCO
+
         boxes = []
-        fg_mask = self.bg_subtractor.apply(frame)
-        fg_mask = cv2.medianBlur(fg_mask, 5)
-        _, fg_mask = cv2.threshold(fg_mask, 250, 255, cv2.THRESH_BINARY)
-        fg_mask = cv2.dilate(fg_mask, np.ones((5, 5), np.uint8), iterations=2)
+        centroids = []
+        for b in results.boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            boxes.append((x1, y1, x2, y2))
+            centroids.append(((x1 + x2) // 2, (y1 + y2) // 2))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
 
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        significant_motion = False
+        self._update_tracks(centroids)
 
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area >= config.MIN_MOTION_AREA:
-                significant_motion = True
-                x, y, w, h = cv2.boundingRect(c)
-                boxes.append((x, y, w, h))
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        anomalies = []
 
-        # ------------------------------------------------------------------
-        # SWAP POINT: replace the block above (or augment it) with a person/
-        # object detector for higher precision, e.g.:
-        #
-        #   results = yolo_model(frame)
-        #   boxes = [b for b in results.boxes if b.cls == PERSON_CLASS]
-        #   significant_motion = len(boxes) > 0
-        # ------------------------------------------------------------------
+        # --- Curfew: any person on a curfew-monitored camera outside hours ---
+        if boxes and self.cfg.get("curfew_monitored", True) and self._within_curfew_hours():
+            if self._cooldown_ok("curfew"):
+                anomalies.append("Unauthorized entry after curfew hours")
 
-        if significant_motion and self._within_active_hours():
-            self.consecutive_motion_frames += 1
-        else:
-            self.consecutive_motion_frames = 0
+        # --- Intrusion zone: ANY person, ANY time (e.g. locked storeroom) ---
+        if boxes and self.cfg.get("intrusion_zone", False):
+            if self._cooldown_ok("intrusion"):
+                anomalies.append("Intruder detected")
 
-        is_anomaly = False
-        if self.consecutive_motion_frames >= config.CONSECUTIVE_FRAMES_THRESHOLD:
-            now = time.time()
-            if now - self.last_alert_time >= config.ALERT_COOLDOWN_SECONDS:
-                is_anomaly = True
-                self.last_alert_time = now
-                self.consecutive_motion_frames = 0
+        # --- Restricted polygon zones within the frame ---
+        zones = self.cfg.get("restricted_zones")
+        if zones:
+            zone_hit = False
+            for c in centroids:
+                for zone in zones:
+                    if point_in_polygon(c, zone):
+                        zone_hit = True
+                        break
+                if zone_hit:
+                    break
+            if zone_hit and self._cooldown_ok("restricted_zone"):
+                anomalies.append("Restricted area intrusion")
+            if zones:
+                for zone in zones:
+                    pts = np.array(zone, dtype=np.int32)
+                    cv2.polylines(frame, [pts], True, (0, 165, 255), 2)
 
-        if boxes:
-            label = "ANOMALY DETECTED" if is_anomaly else "Motion"
-            cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                        (0, 0, 255), 2)
+        # --- Crowd detection ---
+        crowd_threshold = self.cfg.get("crowd_threshold", config.CROWD_THRESHOLD)
+        if len(boxes) >= crowd_threshold and self._cooldown_ok("crowd"):
+            anomalies.append("Crowd detected")
 
-        return is_anomaly, frame, boxes
+        # --- Loitering: someone staying too long ---
+        loiter_seconds = self.cfg.get("loitering_seconds", config.LOITERING_SECONDS)
+        for pid, tp in self.tracked.items():
+            dwell = time.time() - tp.first_seen
+            if dwell >= loiter_seconds and not tp.alerted_loitering:
+                tp.alerted_loitering = True
+                if self._cooldown_ok("loitering"):
+                    anomalies.append("Loitering detected")
+
+        for i, label in enumerate(anomalies):
+            cv2.putText(frame, label, (10, 30 + 25 * i), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (0, 0, 255), 2)
+
+        return anomalies, frame, boxes

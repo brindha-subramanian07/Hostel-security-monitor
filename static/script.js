@@ -14,7 +14,7 @@ async function refreshAlerts() {
     alertList.innerHTML = "";
     alerts.forEach(a => {
       const li = document.createElement("li");
-      li.innerHTML = `<strong>${a.camera_name}</strong> - abnormal activity detected
+      li.innerHTML = `<strong>${a.camera_name}</strong><br>${a.anomaly_type}
                        <span class="time">${formatTime(a.created_at)}</span>`;
       alertList.appendChild(li);
     });

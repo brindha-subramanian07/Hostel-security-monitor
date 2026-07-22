@@ -15,17 +15,17 @@ from datetime import datetime
 import config
 
 
-def send_email_alert(camera_name, snapshot_path):
+def send_email_alert(camera_name, snapshot_path, anomaly_type="Anomaly detected"):
     """Send an email alert with the snapshot attached. Fails silently-logged
     if SMTP is not configured, so it never crashes the detection loop."""
     try:
         msg = EmailMessage()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg["Subject"] = f"[Hostel CCTV Alert] Abnormal activity - {camera_name}"
+        msg["Subject"] = f"[Hostel CCTV Alert] {anomaly_type} - {camera_name}"
         msg["From"] = config.SMTP_USERNAME
         msg["To"] = ", ".join(config.ALERT_RECIPIENTS)
         msg.set_content(
-            f"Abnormal activity detected.\n\n"
+            f"{anomaly_type}\n\n"
             f"Camera: {camera_name}\n"
             f"Time: {timestamp}\n\n"
             f"A snapshot is attached. Please check the live dashboard for more detail."
